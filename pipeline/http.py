@@ -1,10 +1,13 @@
 """Anonymous, rate-limited HTTP with robots, redirect and access checks."""
 from __future__ import annotations
 import time
+import logging
 from urllib.parse import urlsplit, urljoin
 from urllib.robotparser import RobotFileParser
 import requests
 from .config import CollectConfig
+
+logger = logging.getLogger(__name__)
 
 class SkipPage(RuntimeError):
     """This resource is not accessible under the configured collection rules."""
@@ -12,15 +15,25 @@ class SkipPage(RuntimeError):
 class SourceUnavailable(SkipPage):
     """Stop this source for this run; do not hammer an unavailable host."""
 
+class RequestLimitReached(SourceUnavailable):
+    """Local request allowance exhausted, rather than a remote failure."""
+
+class RetryablePage(SkipPage):
+    """Incomplete public response; retry with a persistent per-URL limit."""
+
 class PublicHTTP:
-    def __init__(self, cfg: CollectConfig, hosts: list[str]):
+    def __init__(self, cfg: CollectConfig, hosts: list[str], max_requests: int | None = None):
         self.cfg = cfg
+        self.max_requests = max_requests if max_requests is not None else cfg.max_requests_per_source
         self.hosts = set(hosts)
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": cfg.user_agent, "Accept-Language": "zh-CN,zh;q=0.9"})
         self.robots: dict[str, RobotFileParser] = {}
         self.last_request = 0.0
         self.requests = 0
+        self.page_requests = 0
+        self.retry_requests = 0
+        self.status_counts = {}
 
     def close(self):
         self.session.close()
@@ -34,12 +47,14 @@ class PublicHTTP:
     def _send(self, url: str, delay: float = 0):
         self._validate_url(url)
         for attempt in range(self.cfg.max_retries + 1):
-            if self.requests >= self.cfg.max_requests_per_source:
-                raise SourceUnavailable("该来源已达本次 HTTP 请求上限")
+            if self.requests >= self.max_requests:
+                raise RequestLimitReached("该来源已达本次 HTTP 请求上限")
             wait = max(5,self.cfg.request_interval,delay) - (time.monotonic()-self.last_request)
             if wait > 0:
                 time.sleep(wait)
             self.requests += 1
+            self.page_requests += int(urlsplit(url).path != "/robots.txt")
+            self.retry_requests += int(attempt > 0)
             self.last_request = time.monotonic()
             try:
                 # Never attach user cookies or use alternate identities/proxies.
@@ -56,14 +71,23 @@ class PublicHTTP:
                 finally:
                     response.close()
                 response.encoding = response.encoding if response.encoding and response.encoding.lower() != "iso-8859-1" else "utf-8"
-                if response.status_code in (401,403,407,412,429,451,521):
+                status = str(response.status_code)
+                self.status_counts[status] = self.status_counts.get(status,0) + 1
+                if response.status_code in (401,403,407,412,429,451):
                     raise SourceUnavailable(f"HTTP {response.status_code} 限制访问；停止该来源，不绕过验证")
                 if response.status_code >= 500:
-                    raise requests.ConnectionError("server unavailable")
+                    # Temporary upstream failures are retried with the bounded
+                    # retry budget. The request cap still applies to every try.
+                    if attempt == self.cfg.max_retries:
+                        raise SourceUnavailable(f"HTTP {response.status_code} 服务器错误，重试耗尽")
+                    logger.warning("HTTP 重试 host=%s status=%d attempt=%d/%d wait=%ss",urlsplit(url).hostname,response.status_code,attempt+1,self.cfg.max_retries+1,self.cfg.retry_backoff * 2**attempt)
+                    time.sleep(self.cfg.retry_backoff * 2**attempt)
+                    continue
                 return response
             except requests.RequestException as exc:
                 if attempt == self.cfg.max_retries:
                     raise SourceUnavailable(f"请求失败，重试耗尽（{type(exc).__name__}）") from exc
+                logger.warning("HTTP 重试 host=%s type=%s attempt=%d/%d",urlsplit(url).hostname,type(exc).__name__,attempt+1,self.cfg.max_retries+1)
                 time.sleep(self.cfg.retry_backoff * 2**attempt)
         raise SourceUnavailable("请求失败")
 

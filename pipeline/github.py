@@ -18,7 +18,7 @@ class GitHubCollector:
     def __init__(self,cfg,days: int):
         self.app=cfg
         self.cfg=cfg.sources["github"]
-        self.http=PublicHTTP(cfg.collect,["api.github.com"])
+        self.http=PublicHTTP(cfg.collect,["api.github.com"],self.cfg.max_requests_per_run)
         self.http.session.headers["Accept"]="application/vnd.github+json"
         self.since=(now().date()-timedelta(days=days-1)).isoformat()
         self.files={}
@@ -27,6 +27,7 @@ class GitHubCollector:
         if not path.startswith("/repos/") and not path.startswith("/search/repositories?"):
             raise SkipPage("非允许的 GitHub REST 端点")
         # This is a documented public API (not a robots-exempt web crawler).
+        self.http.page_requests += 1
         response=self.http._send("https://api.github.com"+path)
         if response.status_code!=200:
             raise SkipPage(f"GitHub REST HTTP {response.status_code}")

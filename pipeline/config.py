@@ -23,13 +23,15 @@ class CollectConfig:
     max_pages_per_keyword: int = 2
     max_retries: int = 3
     cookie: str = field(default="",repr=False)  # legacy setting, deliberately unused
-    days: int = 7
+    days: int = 60
     timeout: int = 20
     user_agent: str = "MianjingPipeline/0.2 (personal study; respects robots.txt)"
     max_requests_per_source: int = 40
     max_candidates_per_source: int = 80
     max_response_bytes: int = 12000000
     retry_backoff: int = 5
+    page_attempts_per_day: int = 3
+    page_retry_cooldown: int = 30
 
 
 @dataclass
@@ -40,6 +42,7 @@ class SourceConfig:
     seed_urls: list[str] = field(default_factory=list)
     max_posts: int = 150
     max_discovery_pages: int = 3
+    max_requests_per_run: int | None = None
     repositories: list[str] = field(default_factory=list)
     search_query: str = "面经"
 
@@ -83,6 +86,8 @@ class LLMConfig:
     timeout: int = 90
     confidence_threshold: float = .6
     temperature: float = .1
+    reasoning_effort: str = ""
+    retry_backoff: int = 5
 
 
 @dataclass
@@ -95,7 +100,7 @@ class OutputConfig:
     log_dir: str = "logs"
     high_frequency_min_posts: int = 3
     top_limit: int = 50
-    recency_days: int = 30
+    recency_days: int = 60
     half_life_days: float = 14
     log_max_bytes: int = 5000000
     log_backups: int = 3
@@ -130,7 +135,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     filt = FilterConfig(**(data.get("filter") or {}))
     llm = LLMConfig(**(data.get("llm") or {}))
     output = OutputConfig(**(data.get("output") or {}))
-    llm.api_key = os.environ.get("DEEPSEEK_API_KEY", "") or llm.api_key
+    llm.api_key = os.environ.get("LLM_API_KEY", "") or os.environ.get("DEEPSEEK_API_KEY", "") or llm.api_key
     sources = default_sources()
     for name, source in (data.get("sources") or {}).items():
         if name not in sources:
@@ -144,6 +149,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         raise ValueError("collect.request_interval 必须至少 5 秒")
     if not 0 <= collect.max_retries <= 3 or not 0 <= llm.max_retries <= 2:
         raise ValueError("采集重试最多 3 次，LLM 重试最多 2 次")
+    if not 1 <= collect.page_attempts_per_day <= 3 or collect.page_retry_cooldown < 0 or llm.retry_backoff < 0:
+        raise ValueError("页面日重试次数必须为 1-3，冷却时间不能为负数")
     if min(collect.days, collect.daily_limit, collect.max_requests_per_source,
            collect.max_candidates_per_source, collect.max_response_bytes,
            collect.timeout, llm.daily_token_budget, llm.chunk_chars,
@@ -152,11 +159,15 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         raise ValueError("限额、时间窗、超时、分块大小必须为正数")
     if llm.context_tokens <= llm.max_tokens or not 0 <= llm.confidence_threshold <= 1:
         raise ValueError("模型上下文/置信度配置无效")
+    if llm.reasoning_effort not in ("", "low", "medium", "high"):
+        raise ValueError("llm.reasoning_effort 必须为空、low、medium 或 high")
     if not .9 <= cfg.dedup.threshold <= 1 or cfg.dedup.short_len <= 0 or output.high_frequency_min_posts < 3:
         raise ValueError("去重相似阈值至少 .9，高频题至少 3 个不同帖子")
     for source in sources.values():
         if source.max_posts < 0 or source.max_discovery_pages < 0:
             raise ValueError("来源限额不能为负数")
+        if source.max_requests_per_run is not None and source.max_requests_per_run <= 0:
+            raise ValueError("来源 HTTP 请求上限必须为正数")
     return cfg
 
 

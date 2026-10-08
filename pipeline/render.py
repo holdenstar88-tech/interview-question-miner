@@ -1,6 +1,7 @@
-"""Evidence-preserving monthly Markdown and distinct-post recency ranking."""
+"""One cumulative Markdown per category and distinct-post recency ranking."""
 from __future__ import annotations
 import json
+import logging
 import os
 import re
 from collections import defaultdict
@@ -8,37 +9,51 @@ from datetime import date, timedelta
 from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from .config import AppConfig
-from .runtime import now
+from .runtime import now, iso_date
 
 CATEGORY_DIRS = {"java_backend":"Java后端","agent_ai":"Agent开发","other":"其他"}
 DISCLAIMER = "内容来源于网络公开面经，版权归原作者所有，仅供个人学习。"
+logger = logging.getLogger(__name__)
+
+def _publication_date(row) -> str | None:
+    """Return only the original post's publication date."""
+    value = row["publish_time"] if "publish_time" in row.keys() else ""
+    return iso_date(value)
 
 def md(value) -> str:
     return re.sub(r"([\\`*_{}\[\]<>|])",r"\\\1",str(value or "").replace("\n"," ").replace("\r"," "))
 
-def _group_company_round(rows) -> list[dict]:
-    groups = defaultdict(lambda:defaultdict(list))
+def _group_company_posts(rows) -> list[dict]:
+    groups = defaultdict(dict)
     for row in rows:
-        date_label = "面试日期" if row["round_date"] else "发布日期（面试日期未知）"
-        lines = [f"- **{md(row['question'])}** `{md(row['q_type'])}`",
-                 f"  - {date_label}：{row['event_date']}"]
+        posts = groups[row["company"] or "未知公司"]
+        post = posts.setdefault(row["source_url"],{
+            "title":row["post_title"] or "未命名面经", "source_url":row["source_url"],
+            "publish_date":_publication_date(row) or "", "rounds":defaultdict(list),
+        })
+        lines = [f"- **{md(row['question'])}** `{md(row['q_type'])}`"]
         for follow in json.loads(row["follow_ups"]):
             lines.append(f"  - 追问：{md(follow)}")
-        lines.append(f"  - 来源：[{md(row['post_title'])}]({row['source_url']})")
-        groups[row["company"] or "未知公司"][row["round_name"] or "未标注轮次"].append("\n".join(lines))
-    return [{"company":company,"rounds":[{"round_name":name,"block":"\n".join(items)} for name,items in sorted(rounds.items())]} for company,rounds in sorted(groups.items())]
+        post["rounds"][(row["round_name"] or "未标注轮次",row["round_date"] or "未明确")].append("\n".join(lines))
+    return [{"company":company,"posts":[
+        post | {"rounds":[{"round_name":name,"date":day,"block":"\n".join(items)} for (name,day),items in sorted(post["rounds"].items())]}
+        for post in sorted(posts.values(),key=lambda p:(p["publish_date"],p["source_url"]),reverse=True)
+    ]} for company,posts in sorted(groups.items())]
 
 def rank_questions(rows, cfg: AppConfig, today: date | None = None) -> list[dict]:
     today = today or now().date()
     since = today-timedelta(days=cfg.output.recency_days-1)
     groups = defaultdict(dict)
     for row in rows:
-        day = date.fromisoformat(row["event_date"])
+        published_date = _publication_date(row)
+        if not published_date:
+            continue
+        day = date.fromisoformat(published_date)
         if not since<=day<=today:
             continue
         # One source URL contributes once, even across versions/rounds.
         old = groups[row["hash"]].get(row["source_url"])
-        if old is None or row["event_date"]>old["event_date"]:
+        if old is None or row["publish_time"] > old["publish_time"]:
             groups[row["hash"]][row["source_url"]] = row
     ranked = []
     for h,posts in groups.items():
@@ -49,8 +64,8 @@ def rank_questions(rows, cfg: AppConfig, today: date | None = None) -> list[dict
         ranked.append({"hash":h,"question":first["question"],"q_type":first["q_type"],
             "companies":"、".join(sorted({r["company"] or "未知公司" for r in values})),
             "position_category":"、".join(sorted({CATEGORY_DIRS.get(r["position_category"],"其他") for r in values})),
-            "times_seen":len(posts),"last_seen":max(r["event_date"] for r in values),
-            "score":sum(2**(-((today-date.fromisoformat(r["event_date"])).days)/cfg.output.half_life_days) for r in values),
+            "times_seen":len(posts),"last_seen":max(_publication_date(r) for r in values),
+            "score":sum(2**(-((today-date.fromisoformat(_publication_date(r))).days)/cfg.output.half_life_days) for r in values),
             "sources":[{"url":url,"title":r["post_title"]} for url,r in sorted(posts.items())]})
     ranked.sort(key=lambda r:(-r["score"],-r["times_seen"],r["hash"]))
     return ranked[:cfg.output.top_limit]
@@ -61,34 +76,57 @@ def _write(path: Path, content: str):
     temp.write_text(content,encoding="utf-8")
     os.replace(temp,path)
 
-def render_all(cfg: AppConfig,store) -> list[Path]:
+def render_all(cfg: AppConfig,store,metrics: dict | None = None) -> list[Path]:
     env = Environment(loader=FileSystemLoader(cfg.resolve(cfg.output.template_dir)),undefined=StrictUndefined,autoescape=False)
     env.filters["md"] = md
     rows = store.questions_for_render()
-    month_groups = defaultdict(list)
+    category_groups = defaultdict(list)
     for row in rows:
-        if row["event_date"] <= now().date().isoformat():
-            month_groups[(row["position_category"],row["event_date"][:7])].append(row)
-    current = now().strftime("%Y-%m")
-    # Always overwrite current empty outputs, so old stale content never masquerades as new results.
-    for category in ("java_backend","agent_ai"):
-        month_groups.setdefault((category,current),[])
+        published_date = _publication_date(row)
+        if published_date and published_date <= now().date().isoformat():
+            category_groups[row["position_category"]].append(row)
+    for category in CATEGORY_DIRS:
+        category_groups.setdefault(category,[])
     root = cfg.resolve(cfg.output.output_dir)
-    # Regenerate previously generated month files as empty if all their records
-    # were removed by review/re-extraction; never leave invalidated counts behind.
-    for category,dirname in CATEGORY_DIRS.items():
-        for path in (root/dirname).glob("????-??.md"):
-            if re.fullmatch(r"\d{4}-\d{2}",path.stem):
-                month_groups.setdefault((category,path.stem),[])
     written = []
-    for (category,month),items in sorted(month_groups.items()):
+    for category,items in sorted(category_groups.items()):
         dirname = CATEGORY_DIRS.get(category,"其他")
-        path = root/dirname/f"{month}.md"
-        _write(path,env.get_template("monthly.md.j2").render(title=f"{dirname} 面经汇总（{month}）",generated_at=now().isoformat(timespec="seconds"),count=len(items),companies=sorted({r["company"] or "未知公司" for r in items}),groups=_group_company_round(items),disclaimer=DISCLAIMER))
+        path = root/dirname/"面经汇总.md"
+        _write(path,env.get_template("summary.md.j2").render(title=f"{dirname} 面经汇总",generated_at=now().isoformat(timespec="seconds"),count=len(items),companies=sorted({r["company"] or "未知公司" for r in items}),groups=_group_company_posts(items),disclaimer=DISCLAIMER))
         written.append(path)
-    path = root/"高频题"/"近30天高频题Top50.md"
-    _write(path,env.get_template("top.md.j2").render(title=f"近{cfg.output.recency_days}天高频题 Top{cfg.output.top_limit}",items=rank_questions(rows,cfg),generated_at=now().isoformat(timespec="seconds"),disclaimer=DISCLAIMER,min_posts=cfg.output.high_frequency_min_posts,half_life=cfg.output.half_life_days))
+    # Preserve old monthly output outside the category folders. Only migrate
+    # recognized generated files, after new summaries have been written.
+    archived = 0
+    archive_root = cfg.resolve(cfg.output.db_path).parent/"output-history"/now().strftime('%Y%m%d-%H%M%S-%f')
+    for dirname in CATEGORY_DIRS.values():
+        for old in (root/dirname).glob('????-??.md'):
+            if not re.fullmatch(r'\d{4}-\d{2}',old.stem):
+                continue
+            if DISCLAIMER not in old.read_text(encoding='utf-8'):
+                continue
+            target = archive_root/dirname/old.name
+            target.parent.mkdir(parents=True,exist_ok=True)
+            old.rename(target)
+            archived += 1
+    path = root/"高频题"/f"近{cfg.output.recency_days}天高频题Top{cfg.output.top_limit}.md"
+    ranked = rank_questions(rows,cfg)
+    _write(path,env.get_template("top.md.j2").render(title=f"近{cfg.output.recency_days}天高频题 Top{cfg.output.top_limit}",items=ranked,generated_at=now().isoformat(timespec="seconds"),disclaimer=DISCLAIMER,min_posts=cfg.output.high_frequency_min_posts,half_life=cfg.output.half_life_days))
     written.append(path)
+    metrics = metrics if metrics is not None else {}
+    since = (now().date()-timedelta(days=cfg.output.recency_days-1)).isoformat()
+    recent = [r for r in rows if since<=(_publication_date(r) or '')<=now().date().isoformat()]
+    sources = defaultdict(set)
+    for row in recent:
+        sources[row['hash']].add(row['source_url'])
+    eligible = sum(len(urls)>=cfg.output.high_frequency_min_posts for urls in sources.values())
+    metrics.update(input_occurrences=len(rows),summary_occurrences=sum(len(v) for v in category_groups.values()),
+                   summary_posts=len({r['source_url'] for items in category_groups.values() for r in items}),
+                   archived_monthly_files=archived,
+                   ranking_days=cfg.output.recency_days,ranking_recent_occurrences=len(recent),
+                   ranking_unique_questions=len(sources),ranking_below_min_posts=len(sources)-eligible,
+                   ranking_eligible=eligible,ranking_top_limit_omitted=max(0,eligible-len(ranked)),
+                   ranking_rendered=len(ranked),files=len(written))
+    logger.info("渲染统计：%s",json.dumps(metrics,ensure_ascii=False,sort_keys=True))
     return written
 
 def main() -> int:

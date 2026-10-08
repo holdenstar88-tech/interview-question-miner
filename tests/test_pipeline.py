@@ -25,10 +25,15 @@ TODAY = now().date().isoformat()
 @pytest.fixture
 def cfg(tmp_path,monkeypatch):
     monkeypatch.delenv("DEEPSEEK_API_KEY",raising=False)
+    monkeypatch.delenv("LLM_API_KEY",raising=False)
     cfg = load_config(ROOT/"config.example.yaml")
     cfg.base_dir = tmp_path
     cfg.output.template_dir = str(ROOT/"templates")
     cfg.llm.api_key = "offline-test"
+    cfg.llm.retry_backoff = 0
+    # Reliability tests cover the three-attempt queue behavior explicitly;
+    # production config uses one page attempt per day to avoid same-run churn.
+    cfg.collect.page_attempts_per_day = 3
     return cfg
 
 @pytest.fixture
@@ -104,14 +109,15 @@ def test_high_frequency_and_decay(cfg,store):
     store.set_status(a,"pending_review")
     assert rank_questions(store.questions_for_render(),cfg)==[]
 
-def test_empty_top_and_old_month_not_current(cfg,store):
+def test_summary_includes_history_without_monthly_files(cfg,store):
     a=seed(cfg,store,"1",published="2021-01-01")
     store.save_extraction(a,result(),cfg.dedup)
     render_all(cfg,store)
     root=cfg.resolve(cfg.output.output_dir)
-    assert "Redis" not in (root/"Java后端"/f"{TODAY[:7]}.md").read_text(encoding="utf-8")
-    assert "Redis" in (root/"Java后端"/"2021-01.md").read_text(encoding="utf-8")
-    assert "暂无满足高频条件" in (root/"高频题"/"近30天高频题Top50.md").read_text(encoding="utf-8")
+    assert "Redis" in (root/"Java后端"/"面经汇总.md").read_text(encoding="utf-8")
+    assert "2021-01-01" in (root/"Java后端"/"面经汇总.md").read_text(encoding="utf-8")
+    assert list((root/"Java后端").glob("????-??.md"))==[]
+    assert "暂无满足高频条件" in (root/"高频题"/"近60天高频题Top50.md").read_text(encoding="utf-8")
 
 def test_date_unknown_evidence_and_smalltalk(cfg):
     value=result(question="Redis如何持久化？")
@@ -246,7 +252,9 @@ def test_network_retry_limit_and_access_denial(cfg):
 
 @pytest.mark.parametrize("source,selector,url",[("nowcoder","class='nc-slate-editor-content'","https://www.nowcoder.com/discuss/1"),("csdn","id='content_views'","https://blog.csdn.net/a/article/details/1"),("juejin","class='article-content'","https://juejin.cn/post/1")])
 def test_public_parsers_and_paywall(source,selector,url):
-    html=f'<html><h1>Java面经</h1><meta property="article:published_time" content="{TODAY}"><div {selector}>Redis如何持久化？这里是面试官的追问。'*3+'</div></html>'
+    html=f'<h1>Java面经</h1><meta property="article:published_time" content="{TODAY}"><div {selector}>'+('Redis如何持久化？这里是面试官的追问。'*3)+'</div>'
+    if source=='nowcoder':
+        html += '<script>window.__INITIAL_STATE__='+json.dumps({'prefetchData':{'2':{'contentId':'1','ssrCommonData':{'contentData':{'id':'1','createTime':TODAY}}}}})+'</script>'
     assert parse_article(url,html,source).publish_time==TODAY
     with pytest.raises(SkipPage):parse_article(url,html+"付费后可阅读",source)
     with pytest.raises(SkipPage):parse_article(url,"<h1>只有摘要</h1>",source)
@@ -259,11 +267,34 @@ def test_daily_limits_time_window_and_failure_isolation(cfg,store):
     def fetch(self,url):
         published="2021-01-01" if url.endswith("1") else TODAY
         return RawPost(url,url[-1],"Java面经","",published,now().isoformat(),"正文"*30)
+    metrics={}
     with patch.object(PublicCollector,"discover",return_value=urls),patch.object(PublicCollector,"fetch",fetch):
-        assert collect_incremental(cfg,7)==2
+        assert collect_incremental(cfg,7,metrics=metrics)==2
         assert collect_incremental(cfg,7)==0
     assert store.collected_today()==2
     assert not store.has_post(urls[0])
+    assert metrics["days"]==7 and metrics["collected"]==2
+    assert metrics["sources"]["nowcoder"]["outside_time_window"]==1
+    assert metrics["sources"]["nowcoder"]["candidates_returned"]==3
+
+def test_sixty_day_collection_window_includes_day_60_but_not_day_61(cfg,store):
+    from datetime import date
+    today=date.fromisoformat(TODAY)
+    oldest_included=(today-timedelta(days=59)).isoformat()
+    oldest_excluded=(today-timedelta(days=60)).isoformat()
+    urls=[f"https://www.nowcoder.com/discuss/{i}" for i in range(1,4)]
+    published={urls[0]:oldest_included,urls[1]:oldest_excluded,urls[2]:(today+timedelta(days=1)).isoformat()}
+    def fetch(self,url):
+        return RawPost(url,url.rsplit("/",1)[-1],"Java面经","",published[url],now().isoformat(),"面试正文"*20)
+    cfg.sources["csdn"].enabled=False
+    cfg.sources["juejin"].enabled=False
+    cfg.sources["github"].enabled=False
+    metrics={}
+    with patch.object(PublicCollector,"discover",return_value=urls),patch.object(PublicCollector,"fetch",fetch):
+        assert collect_incremental(cfg,60,metrics=metrics)==1
+    assert metrics["window_start"]==oldest_included
+    assert metrics["sources"]["nowcoder"]["collected"]==1
+    assert metrics["sources"]["nowcoder"]["outside_time_window"]==2
 
 def test_raw_immutable_and_orphan_recovery(cfg,store):
     post=RawPost("https://www.nowcoder.com/discuss/1","1","Java面经","",TODAY,now().isoformat(),"original")
@@ -292,6 +323,13 @@ def test_cli_entrypoints_clean_install(cfg,command):
     path.write_text(json.dumps(data),encoding="utf-8")
     proc=subprocess.run([sys.executable,"-m",*command,"--config",str(path)],cwd=ROOT,capture_output=True)
     assert proc.returncode==0,proc.stderr.decode(errors="replace")
+    if command[-1]=="run":
+        with Store(cfg.resolve(cfg.output.db_path)) as run_store:
+            detail=json.loads(run_store.conn.execute("SELECT detail FROM runs ORDER BY id DESC LIMIT 1").fetchone()[0])
+        assert detail["window_days"]==60
+        assert detail["collection"]["days"]==60
+        assert detail["outputs"]
+        assert detail["exit_code"]==0
 
 def test_migration_backup_queues_old_extraction(cfg):
     path=cfg.resolve(cfg.output.db_path)
@@ -303,7 +341,9 @@ def test_migration_backup_queues_old_extraction(cfg):
     conn.commit()
     conn.close()
     with Store(path) as store:
-        assert len(store.posts_by_status("to_extract"))==1
+        assert store.conn.execute("SELECT count(*) FROM posts WHERE status='to_extract'").fetchone()[0]==1
+        assert store.posts_by_status("to_extract")==[]  # Original post date must be rechecked first.
+        assert len(store.retry_candidates('nowcoder',3,80))==1
         assert store.conn.execute("SELECT count(*) FROM legacy_questions").fetchone()[0]==1
     assert len(list(path.parent.glob("*.pre-v2-*.db")))==1
 
@@ -329,6 +369,27 @@ def test_sitemap_discovery_bounds_and_robots(cfg):
     xml='<?xml version="1.0"?><urlset>'+''.join(f'<url><loc>https://juejin.cn/post/{i}</loc></url>' for i in [1,2,3])+'</urlset>'
     with patch.object(c.http,"get",return_value=response(xml)):
         assert c.discover()==["https://juejin.cn/post/3","https://juejin.cn/post/2"]
+    c.http.close()
+
+def test_sitemap_lastmod_only_prioritizes_candidates(cfg):
+    cfg.collect.max_candidates_per_source=1
+    c=PublicCollector(cfg,"juejin")
+    xml=f'''<?xml version="1.0"?><urlset>
+      <url><loc>https://juejin.cn/post/101</loc><lastmod>{TODAY}T00:00:00Z</lastmod></url>
+      <url><loc>https://juejin.cn/post/999</loc><lastmod>2020-01-01T00:00:00Z</lastmod></url>
+      <url><loc>https://juejin.cn/post/1000</loc></url>
+    </urlset>'''
+    with patch.object(c.http,"get",return_value=response(xml)):
+        assert c.discover()==["https://juejin.cn/post/101"]
+    c.http.close()
+
+def test_discovery_does_not_discard_articles_without_interview_words_in_title(cfg):
+    c=PublicCollector(cfg,"nowcoder")
+    html='<html><a href="https://www.nowcoder.com/discuss/101">Java 技术总结</a></html>'
+    with patch.object(c.http,"get",return_value=response(html)):
+        assert c.discover()==["https://www.nowcoder.com/discuss/101"]
+    assert c.discovery_stats["article_links"]==1
+    assert c.discovery_stats["candidates_returned"]==1
     c.http.close()
 
 def test_missing_date_is_never_assumed_today():
@@ -364,6 +425,30 @@ def test_schema_missing_evidence_retries(cfg):
         assert chat.call_count==2
     e.close()
 
+def test_reasoning_effort_uses_completion_tokens_without_temperature(cfg):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    cfg.llm.api_key="offline-test"
+    cfg.llm.reasoning_effort="high"
+    e=Extractor(cfg)
+    fake=Mock()
+    fake.chat.completions.create.return_value=SimpleNamespace(
+        usage=SimpleNamespace(total_tokens=12),
+        choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))])
+    e.client.close()
+    e.client=fake
+    assert e._chat("probe")==("{}",12)
+    request=fake.chat.completions.create.call_args.kwargs
+    assert request["reasoning_effort"]=="high"
+    assert request["max_completion_tokens"]==cfg.llm.max_tokens
+    assert "temperature" not in request and "max_tokens" not in request
+    e.close()
+
+def test_generic_llm_api_key_env_precedes_legacy_and_config(cfg,monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY","generic-env-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY","legacy-env-key")
+    assert load_config(ROOT/"config.example.yaml").llm.api_key=="generic-env-key"
+
 def test_budget_day_rollover(cfg):
     from datetime import datetime
     import pipeline.budget as budget_module
@@ -381,10 +466,19 @@ def test_recent_questions_outrank_more_old_occurrences(cfg):
     rows=[]
     for key,count,age in [("recent",3,0),("older",5,14)]:
         for i in range(count):
-            rows.append({"hash":key,"source_url":f"https://example.test/{key}/{i}","event_date":(now().date()-timedelta(days=age)).isoformat(),"question":key,"q_type":"八股","company":"公司","position_category":"java_backend","post_title":"面经"})
+            rows.append({"hash":key,"source_url":f"https://example.test/{key}/{i}","publish_time":(now().date()-timedelta(days=age)).isoformat(),"question":key,"q_type":"八股","company":"公司","position_category":"java_backend","post_title":"面经"})
     ranks=rank_questions(rows,cfg)
     assert [r["question"] for r in ranks]==["recent","older"]
     assert ranks[1]["score"]==2.5
+
+def test_frequency_ranking_uses_sixty_day_window(cfg):
+    from datetime import date
+    today=date.fromisoformat(TODAY)
+    rows=[]
+    for key,age in [("day-60",59),("day-61",60)]:
+        for i in range(3):
+            rows.append({"hash":key,"source_url":f"https://example.test/{key}/{i}","publish_time":(today-timedelta(days=age)).isoformat(),"question":key,"q_type":"八股","company":"公司","position_category":"java_backend","post_title":"面经"})
+    assert [row["question"] for row in rank_questions(rows,cfg)]==["day-60"]
 
 def test_revalidate_removes_smalltalk_without_llm(cfg,store):
     from pipeline.extract import revalidate
@@ -405,8 +499,12 @@ def test_minimum_request_interval_cannot_be_disabled(cfg):
     with pytest.raises(ValueError,match="至少 5 秒"):load_config(path)
 
 @pytest.mark.skipif(sys.platform!="win32",reason="Windows batch entry point")
-def test_batch_first_launch_and_exit_code(cfg):
+def test_batch_first_launch_and_exit_code(cfg,monkeypatch):
     import shutil
+    import os
+    # The temporary project has no .venv; exercise fallback with the same
+    # dependency-equipped interpreter that is running this offline suite.
+    monkeypatch.setenv("PATH",str(Path(sys.executable).parent)+os.pathsep+os.environ.get("PATH",""))
     shutil.copytree(ROOT/"pipeline",cfg.base_dir/"pipeline",ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copy(ROOT/"run_daily.bat",cfg.base_dir/"run_daily.bat")
     data=asdict(cfg)

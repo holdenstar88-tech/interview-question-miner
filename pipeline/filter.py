@@ -18,13 +18,13 @@ def _contains(haystack: str, word: str) -> bool:
 
 
 def passes_coarse_filter(
-    title: str, content_head: str, interview_words: list[str], position_words: list[str]
+    title: str, content: str, interview_words: list[str], position_words: list[str]
 ) -> tuple[bool, str]:
-    """标题 + 正文前 500 字必须同时命中面试词与岗位词。
+    """标题 + 完整公开正文必须同时命中面试词与岗位词。
 
     返回 (是否通过, 原因说明),原因写入日志便于调词表。
     """
-    haystack = f"{title}\n{content_head[:500]}"
+    haystack = f"{title}\n{content}"
     hit_interview = [w for w in interview_words if _contains(haystack, w)]
     hit_position = [w for w in position_words if _contains(haystack, w)]
     if not hit_interview:

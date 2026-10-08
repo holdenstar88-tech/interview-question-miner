@@ -3,16 +3,22 @@
 > 生成时间:{{ generated_at }}
 > 本月题目条目:{{ count }} 条 | 覆盖公司:{{ companies | join('、') }}
 > {{ disclaimer }}
-> 按面试日期归档；日期未明确时按发布日期归档，并标注日期类型。不是按采集日期归档。
+> 按原帖发布日期归档；帖子发布时间之外的日期不参与归档。不是按采集日期归档。
 
 {% for group in groups %}
 ## {{ group.company | md }}
 
-{% for round in group.rounds %}
-### {{ round.round_name | md }}
+{% for post in group.posts %}
+### {{ post.title | md }}
+
+来源：[原帖]({{ post.source_url }}) · 发布日期：{{ post.publish_date }}
+
+{% for round in post.rounds %}
+#### {{ round.round_name | md }}
 
 {{ round.block }}
 
+{% endfor %}
 {% endfor %}
 {% endfor %}
 {% if not groups %}

@@ -1,0 +1,26 @@
+# {{ title }}
+
+> 生成时间：{{ generated_at }}
+> 专业问题条目：{{ count }} 条 | 覆盖公司：{{ companies | join('、') }}
+> {{ disclaimer }}
+> 持续汇总已收录记录，不按月份拆分。原帖发布日期与面试日期分别标注；未知面试日期不推测。
+
+{% for group in groups %}
+## {{ group.company | md }}
+
+{% for post in group.posts %}
+### {{ post.title | md }}
+
+来源：[原帖]({{ post.source_url }}) · 原帖发布日期：{{ post.publish_date }}
+
+{% for round in post.rounds %}
+#### {{ round.round_name | md }} · 面试日期：{{ round.date }}
+
+{{ round.block }}
+
+{% endfor %}
+{% endfor %}
+{% endfor %}
+{% if not groups %}
+暂无包含具体专业知识问题的已收录面经。
+{% endif %}

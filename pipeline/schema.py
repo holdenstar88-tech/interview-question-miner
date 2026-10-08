@@ -86,6 +86,17 @@ def _strict(schema: dict):
     if schema.get("type") == "array":
         _strict(schema["items"])
 
+SYSTEM_PROMPT += """
+只保留面试官实际问出的、包含明确技术对象或具体技术场景的专业问题。
+只收录软件开发/研发岗位（如Java后端、Agent/AI应用开发、前端、全栈、服务端等）。测试、测试开发、测开、QA、SDET、质量工程师及产品、运营、运维等非开发岗位不收录，返回 is_interview_post=false、rounds=[]。
+按原帖实际面试岗位判断，不按题目技术栈猜岗位：测开面试即使问Agent、Java、RAG也不能归为开发岗；开发岗位出现单元测试等技术问题不因此排除。
+“问了项目”“简单聊了多Agent项目”“介绍项目背景”“项目有什么难点/亮点”没有具体技术内容时，不是可收录的题目，不能据此补写问题。
+薪资、到岗、入职、实习地点、自我介绍、泛泛的工作经历或是否使用过某技术，不收录。
+项目追问必须明确涉及实现、原理、设计、故障、性能、安全等技术内容；具体算法题和原理主题（如TCP三次握手）可以保留。
+若泛泛项目介绍后附有具体技术追问，只保留具体技术追问及其原文证据，不补全原帖未给出的条件。
+全文没有符合要求的专业问题时，返回 is_interview_post=false、rounds=[]，即使原帖确实发生过面试。
+"""
+
 _strict(EXTRACTION_SCHEMA)
 EXTRACTION_SCHEMA["properties"]["rounds"]["items"]["properties"]["date"]["format"] = "date"
 _question_schema = EXTRACTION_SCHEMA["properties"]["rounds"]["items"]["properties"]["questions"]["items"]
